@@ -155,6 +155,24 @@ class ReplayEngine:
         # 排序
         df = df.sort_values('datetime').reset_index(drop=True)
         
+        # --- 分秒平滑处理 (Plan A) ---
+        # 如果数据只有分钟精度，将同一分钟内的多笔成交均匀分布在 60 秒内
+        if len(df) > 1:
+            df['_min_group'] = df['datetime'].dt.floor('min')
+            df['_cum_count'] = df.groupby('_min_group').cumcount()
+            df['_total_in_min'] = df.groupby('_min_group')['datetime'].transform('count')
+            
+            # 只有当秒数为 0 时才尝试平滑（避免破坏原本就有秒数的数据）
+            # 检查第一笔是否有秒数
+            if df['datetime'].iloc[0].second == 0:
+                df['datetime'] = df['_min_group'] + pd.to_timedelta(
+                    (df['_cum_count'] * 60 / df['_total_in_min']).astype(int), unit='s'
+                )
+            
+            df.drop(columns=['_min_group', '_cum_count', '_total_in_min'], inplace=True)
+            # 平滑后重新排序以防万一
+            df = df.sort_values('datetime').reset_index(drop=True)
+        
         # 计算累计成交量
         if 'vol' in df.columns:
             df['cum_volume'] = df['vol'].cumsum()
@@ -331,6 +349,24 @@ class ReplayEngine:
         process_time = time.time() - process_start
         logging.info(f"   预处理完成: {process_time:.2f}秒 (向量化)")
         
+        # D. 分秒平滑处理 (Plan A)
+        # 如果数据只有分钟精度，将同一分钟内的多笔成交均匀分布在 60 秒内
+        logging.info(f"   正在执行分秒平滑处理 (Plan A)...")
+        # 确保数据有序
+        df = df.sort_values(['stock_code', 'datetime']).reset_index(drop=True)
+        
+        df['_cum_count'] = df.groupby(['stock_code', 'datetime']).cumcount()
+        df['_total_in_min'] = df.groupby(['stock_code', 'datetime'])['price'].transform('count')
+        
+        # 只有在检测到是分钟级数据（秒数为0）时才平滑
+        if not df.empty and df['datetime'].iloc[0].second == 0:
+            # 性能关键：使用向量化加法
+            df['datetime'] = df['datetime'] + pd.to_timedelta(
+                (df['_cum_count'] * 60 / df['_total_in_min']).astype(int), unit='s'
+            )
+            
+        df.drop(columns=['_cum_count', '_total_in_min'], inplace=True)
+        
         # 3. 极速拆分
         split_start = time.time()
         total_stocks = df['stock_code'].nunique()
@@ -430,15 +466,34 @@ class ReplayEngine:
             last_idx = self.index_cache.get(stock_code, 0)
             
             # --- 极速索引查找 ---
-            # 智能查找：如果时间递增，从上次位置开始线性查找（大多数情况）
+            # 优化逻辑：智能切换线性扫描和二分查找
+            # 1. 正常回放（时间微增）：只能线性扫描（非常快）
+            # 2. 拖动滑块（大幅跳转）：强制二分查找（避免数千次循环）
+            
+            should_scan_linearly = False
+            
             if last_idx < len(times) and target_np >= times[last_idx]:
+                # 只有当目标时间在当前位置的"附近"时，才使用线性扫描
+                # 设定阈值：例如检查往后20个点的位置
+                lookahead = 20
+                if last_idx + lookahead >= len(times):
+                    # 剩余数据不足20个，直接线性扫完
+                    should_scan_linearly = True
+                elif times[last_idx + lookahead] >= target_np:
+                    # 如果往后20个点的时间已经超过目标时间，说明目标就在这20个点之内
+                    # 此时线性扫描比二分查找更快
+                    should_scan_linearly = True
+                # else: 目标在20个点之外，意味着发生了较大跨度跳转 -> 使用二分查找
+            
+            if should_scan_linearly:
                 # 向前线性扫描
                 idx = last_idx
-                # 只有当差距较小时才线性扫描，否则还是二分快
+                # 使用 numpy 的逐元素比较通常比 python 循环快，但在小范围内 Python 循环 overhead 也不大
+                # 为了极致性能，保持原逻辑但有范围限制
                 while idx + 1 < len(times) and times[idx + 1] <= target_np:
                     idx += 1
             else:
-                # 时间回退或跳跃，使用二分查找
+                # 时间回退或大幅度跳跃，使用二分查找
                 idx = np.searchsorted(times, target_np, side='right') - 1
             
             # 更新索引缓存
@@ -454,13 +509,19 @@ class ReplayEngine:
                 # 计算涨跌幅
                 if pre_close > 0:
                     pct_change = (current_price - pre_close) / pre_close * 100
+                    # 计算开盘涨跌幅 (使用当日前几笔作为开盘价)
+                    open_price = price_vals[0]
+                    open_pct_change = (open_price - pre_close) / pre_close * 100
                 else:
                     pct_change = 0.0
+                    open_pct_change = 0.0
                 
                 snapshot['stocks'][stock_code] = {
                     'price': float(current_price),
+                    'open_price': float(open_price),
                     'volume': float(cum_volume),
                     'pct_change': float(pct_change),
+                    'open_pct_change': float(open_pct_change),
                 }
                 
                 # 统计涨跌
@@ -488,50 +549,36 @@ class ReplayEngine:
     
     def calculate_stock_rankings(self, snapshot: Dict, top_n: int = 50) -> pd.DataFrame:
         """
-        计算个股涨幅排行
-        
-        Args:
-            snapshot: 市场快照
-            top_n: 返回前N名
-            
-        Returns:
-            排行榜DataFrame
+        计算个股涨幅排行 - 优化版 (利用预处理好的数组)
         """
-        stocks_list = []
-        
-        for code, data in snapshot['stocks'].items():
-            stocks_list.append({
-                'stock_code': code,
-                'stock_name': self.get_stock_name(code),
-                'price': data.get('price', 0),
-                'pct_change': data.get('pct_change', 0),
-                'volume': data.get('volume', 0),
-            })
-        
-        # 如果没有数据,返回空DataFrame但包含所需列
-        if not stocks_list:
+        if not snapshot.get('stocks'):
             return pd.DataFrame(columns=['stock_code', 'stock_name', 'price', 'pct_change', 'volume'])
         
-        df = pd.DataFrame(stocks_list)
+        # 提取数据
+        stocks_data = snapshot['stocks']
+        codes = list(stocks_data.keys())
         
-        # 按涨跌幅排序
+        # 向量化构建 DataFrame (比循环快)
+        df = pd.DataFrame({
+            'stock_code': codes,
+            'price': [d['price'] for d in stocks_data.values()],
+            'pct_change': [d['pct_change'] for d in stocks_data.values()],
+            'volume': [d['volume'] for d in stocks_data.values()]
+        })
+        
+        # 映射名称
+        df['stock_name'] = df['stock_code'].map(self.stock_name_map)
+        
+        # 排序并截断
         df = df.sort_values('pct_change', ascending=False).head(top_n)
         df = df.reset_index(drop=True)
-        df.index += 1  # 排名从1开始
+        df.index += 1
         
         return df
     
     def calculate_sector_rankings(self, snapshot: Dict, sector_type: str = 'industry', top_n: int = 20) -> pd.DataFrame:
         """
-        计算板块涨幅排行
-        
-        Args:
-            snapshot: 市场快照
-            sector_type: 板块类型 ('industry', 'concept', 'region')
-            top_n: 返回前N名
-            
-        Returns:
-            板块排行榜DataFrame
+        计算板块涨幅排行 - 优化版
         """
         # 选择映射表
         if sector_type == 'industry':
@@ -543,43 +590,48 @@ class ReplayEngine:
         else:
             sector_map = self.industry_map
         
-        sector_data = defaultdict(lambda: {'total_pct': 0, 'count': 0, 'volume': 0, 'stocks': []})
+        if not snapshot.get('stocks'):
+            return pd.DataFrame(columns=['sector', 'avg_pct_change', 'stock_count', 'total_volume', 'sector_type'])
+
+        sector_stats = defaultdict(lambda: {'total_pct': 0.0, 'count': 0, 'volume': 0.0})
         
-        # 聚合板块数据
+        # 聚合板块数据 (优化循环)
         for code, data in snapshot['stocks'].items():
-            sectors = sector_map.get(code, ['未分类'])
-            if not isinstance(sectors, list):
-                sectors = [sectors]
-            
-            # 一只股票可能属于多个板块
-            for sector in sectors:
-                sector_data[sector]['total_pct'] += data.get('pct_change', 0)
-                sector_data[sector]['count'] += 1
-                sector_data[sector]['volume'] += data.get('volume', 0)
-                sector_data[sector]['stocks'].append(code)
-        
-        # 计算板块平均涨幅
-        sectors_list = []
-        for sector, data in sector_data.items():
-            # 过滤掉"未分类"板块
-            if sector == '未分类':
+            sectors = sector_map.get(code)
+            if not sectors:
                 continue
-                
-            if data['count'] > 0:
-                avg_pct = data['total_pct'] / data['count']
-                sectors_list.append({
+            
+            # 修正异常涨幅贡献
+            stock_pct = data.get('pct_change', 0)
+            if abs(stock_pct) > 30:
+                open_price = data.get('open_price', 0)
+                current_price = data.get('price', 0)
+                stock_pct = ((current_price - open_price) / open_price * 100) if open_price > 0 else 0
+            
+            vol = data.get('volume', 0)
+            
+            for sector in sectors:
+                stat = sector_stats[sector]
+                stat['total_pct'] += stock_pct
+                stat['count'] += 1
+                stat['volume'] += vol
+        
+        # 转化为 DataFrame
+        if not sector_stats:
+            return pd.DataFrame(columns=['sector', 'avg_pct_change', 'stock_count', 'total_volume', 'sector_type'])
+            
+        res = []
+        for sector, stat in sector_stats.items():
+            if stat['count'] > 0:
+                res.append({
                     'sector': sector,
-                    'avg_pct_change': avg_pct,
-                    'stock_count': data['count'],
-                    'total_volume': data['volume'],
-                    'sector_type': sector_type,
+                    'avg_pct_change': stat['total_pct'] / stat['count'],
+                    'stock_count': stat['count'],
+                    'total_volume': stat['volume'],
+                    'sector_type': sector_type
                 })
         
-        # 如果没有数据,返回空DataFrame但包含所需列
-        if not sectors_list:
-            return pd.DataFrame(columns=['sector', 'avg_pct_change', 'stock_count', 'total_volume', 'sector_type'])
-        
-        df = pd.DataFrame(sectors_list)
+        df = pd.DataFrame(res)
         df = df.sort_values('avg_pct_change', ascending=False).head(top_n)
         df = df.reset_index(drop=True)
         df.index += 1

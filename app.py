@@ -62,7 +62,7 @@ def format_pct_change(value):
         return f'{value:.2f}%'
 
 
-@st.fragment(run_every="1s")
+@st.fragment(run_every="0.5s")
 def auto_refresh_display(engine, current_date, start_time, end_time, 
                          replay_speed_multiplier, top_n_stocks, top_n_sectors,
                          rapid_rise_window, rapid_rise_threshold):
@@ -85,7 +85,10 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
     # 只有在自动刷新开启时才推进时间
     if st.session_state.get('auto_refresh', False):
         if st.session_state.replay_time < end_datetime:
-            new_time = st.session_state.replay_time + pd.Timedelta(seconds=replay_speed_multiplier)
+            # 改进：由于刷新率提高到了 0.5s，每次推进的时间应该是 (倍速 * 0.5) 秒
+            # 使用 milliseconds 避免浮点数精度问题
+            increment_ms = int(replay_speed_multiplier * 500)
+            new_time = st.session_state.replay_time + pd.Timedelta(milliseconds=increment_ms)
             
             # 跳过午休时间 (11:30-13:00)
             if new_time.time() >= time(11, 30) and new_time.time() < time(13, 0):
@@ -93,9 +96,10 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
                 if st.session_state.replay_time.time() < time(11, 30):
                     new_time = datetime.combine(current_date, time(13, 0))
             
-            # 修正：确保不超过结束时间 (15:00)
-            if new_time > end_datetime:
+            # 修正：确保不超过结束时间 (15:00)，如果到达结束时间则停止自动刷新
+            if new_time >= end_datetime:
                 new_time = end_datetime
+                st.session_state.auto_refresh = False
             
             st.session_state.replay_time = new_time
     
@@ -374,10 +378,110 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
                 key="stock_ranking_display"
             )
             
+        else:
+            st.info("暂无数据")
+    
+    with tab2:
+        st.subheader("🏢 板块涨幅排行")
+        sector_rankings = engine.calculate_sector_rankings(snapshot, top_n=top_n_sectors)
+        
+        if not sector_rankings.empty:
+            display_df = sector_rankings.copy()
+            display_df['平均涨跌幅'] = display_df['avg_pct_change'].apply(
+                lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%"
+            )
             
-            # 个股分时详情查看器
-            st.divider()
-            st.markdown("### 🔍 个股分时详情查看器")
+            st.dataframe(
+                display_df[['sector', '平均涨跌幅', 'stock_count']],
+                column_config={
+                    'sector': '板块',
+                    'stock_count': '成分股数量',
+                },
+                hide_index=False,
+                width='stretch'
+            )
+        else:
+            st.info("暂无数据(请确保已加载行业映射文件)")
+    
+    with tab3:
+        st.subheader("⚡ 异动监控")
+        
+        # 添加异动监控条件设置
+        col_filter1, col_filter2, col_filter3 = st.columns(3)
+        
+        with col_filter1:
+            monitor_rise = st.checkbox("监控涨幅", value=True, help="监控快速拉升", key="cb_monitor_rise")
+            if monitor_rise:
+                rise_threshold = st.slider("涨幅阈值(%)", 1.0, 10.0, rapid_rise_threshold, 0.5, key="rise_thresh")
+            else:
+                rise_threshold = None
+        
+        with col_filter2:
+            monitor_fall = st.checkbox("监控跌幅", value=True, help="监控快速下跌", key="cb_monitor_fall")
+            if monitor_fall:
+                fall_threshold = st.slider("跌幅阈值(%)", -10.0, -1.0, -rapid_rise_threshold, 0.5, key="fall_thresh")
+            else:
+                fall_threshold = None
+        
+        with col_filter3:
+            enable_volume_filter = st.checkbox("成交额过滤", value=False, help="只显示成交额达到一定金额的异动", key="cb_vol_filter")
+            if enable_volume_filter:
+                volume_threshold = st.number_input("最小成交额(万元)", min_value=0, value=100, step=50, key="vol_thresh")
+            else:
+                volume_threshold = None
+        
+        # 调用异动检测
+        abnormal_stocks = engine.detect_abnormal_movement(
+            time_window_minutes=rapid_rise_window,
+            rise_threshold=rise_threshold,
+            fall_threshold=fall_threshold,
+            volume_threshold=volume_threshold
+        )
+        
+        if abnormal_stocks:
+            abnormal_df = pd.DataFrame(abnormal_stocks)
+            # 添加股票名称
+            abnormal_df['stock_name'] = abnormal_df['stock_code'].apply(lambda x: engine.get_stock_name(x))
+            
+            # 格式化异动类型
+            def format_movement_type(row):
+                if row['movement_type'] == 'rise':
+                    return f"🔴 +{row['pct_change']:.2f}%"
+                else:
+                    return f"🟢 {row['pct_change']:.2f}%"
+            
+            abnormal_df['异动'] = abnormal_df.apply(format_movement_type, axis=1)
+            abnormal_df['起始价'] = abnormal_df['start_price'].apply(lambda x: f"¥{x:.2f}")
+            abnormal_df['当前价'] = abnormal_df['end_price'].apply(lambda x: f"¥{x:.2f}")
+            abnormal_df['成交额'] = abnormal_df['volume_amount'].apply(lambda x: f"{x:.1f}万")
+            
+            # 显示异动列表
+            st.dataframe(
+                abnormal_df[['stock_code', 'stock_name', '起始价', '当前价', '异动', '成交额']],
+                column_config={
+                    'stock_code': '代码',
+                    'stock_name': '名称',
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.caption(f"📊 检测到 {len(abnormal_df)} 只异动股票（时间窗口：{rapid_rise_window}分钟）")
+        else:
+            conditions = []
+            if rise_threshold:
+                conditions.append(f"涨幅>{rise_threshold}%")
+            if fall_threshold:
+                conditions.append(f"跌幅<{fall_threshold}%")
+            condition_text = " 或 ".join(conditions) if conditions else "任何条件"
+            st.info(f"暂无股票在 {rapid_rise_window} 分钟内满足 {condition_text}")
+    
+    with tab4:
+        st.subheader("🔍 个股分时查看器")
+        
+        if len(engine.all_data) > 0:
+            # 获取个股排行以供默认选择（如果没有搜索的话）
+            stock_rankings = engine.calculate_stock_rankings(snapshot, top_n=50)
             
             # 检查是否在播放中
             is_playing = st.session_state.get('auto_refresh', False)
@@ -747,231 +851,7 @@ def auto_refresh_display(engine, current_date, start_time, end_time,
                         st.warning(f"❌ 未加载股票 {stock_code} 的数据")
         else:
             st.info("暂无数据")
-    
-    with tab2:
-        st.subheader("🏢 板块涨幅排行")
-        sector_rankings = engine.calculate_sector_rankings(snapshot, top_n=top_n_sectors)
         
-        if not sector_rankings.empty:
-            display_df = sector_rankings.copy()
-            display_df['平均涨跌幅'] = display_df['avg_pct_change'].apply(
-                lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%"
-            )
-            
-            st.dataframe(
-                display_df[['sector', '平均涨跌幅', 'stock_count']],
-                column_config={
-                    'sector': '板块',
-                    'stock_count': '成分股数量',
-                },
-                hide_index=False,
-                width='stretch'
-            )
-        else:
-            st.info("暂无数据(请确保已加载行业映射文件)")
-    
-    with tab3:
-        st.subheader("⚡ 异动监控")
-        
-        # 添加异动监控条件设置
-        col_filter1, col_filter2, col_filter3 = st.columns(3)
-        
-        with col_filter1:
-            monitor_rise = st.checkbox("监控涨幅", value=True, help="监控快速拉升")
-            if monitor_rise:
-                rise_threshold = st.slider("涨幅阈值(%)", 1.0, 10.0, rapid_rise_threshold, 0.5, key="rise_thresh")
-            else:
-                rise_threshold = None
-        
-        with col_filter2:
-            monitor_fall = st.checkbox("监控跌幅", value=True, help="监控快速下跌")
-            if monitor_fall:
-                fall_threshold = st.slider("跌幅阈值(%)", -10.0, -1.0, -rapid_rise_threshold, 0.5, key="fall_thresh")
-            else:
-                fall_threshold = None
-        
-        with col_filter3:
-            enable_volume_filter = st.checkbox("成交额过滤", value=False, help="只显示成交额达到一定金额的异动")
-            if enable_volume_filter:
-                volume_threshold = st.number_input("最小成交额(万元)", min_value=0, value=100, step=50, key="vol_thresh")
-            else:
-                volume_threshold = None
-        
-        # 调用异动检测
-        abnormal_stocks = engine.detect_abnormal_movement(
-            time_window_minutes=rapid_rise_window,
-            rise_threshold=rise_threshold,
-            fall_threshold=fall_threshold,
-            volume_threshold=volume_threshold
-        )
-        
-        if abnormal_stocks:
-            abnormal_df = pd.DataFrame(abnormal_stocks)
-            # 添加股票名称
-            abnormal_df['stock_name'] = abnormal_df['stock_code'].apply(lambda x: engine.get_stock_name(x))
-            
-            # 格式化异动类型
-            def format_movement_type(row):
-                if row['movement_type'] == 'rise':
-                    return f"🔴 +{row['pct_change']:.2f}%"
-                else:
-                    return f"🟢 {row['pct_change']:.2f}%"
-            
-            abnormal_df['异动'] = abnormal_df.apply(format_movement_type, axis=1)
-            abnormal_df['起始价'] = abnormal_df['start_price'].apply(lambda x: f"¥{x:.2f}")
-            abnormal_df['当前价'] = abnormal_df['end_price'].apply(lambda x: f"¥{x:.2f}")
-            abnormal_df['成交额'] = abnormal_df['volume_amount'].apply(lambda x: f"{x:.1f}万")
-            
-            # 显示异动列表
-            st.dataframe(
-                abnormal_df[['stock_code', 'stock_name', '起始价', '当前价', '异动', '成交额']],
-                column_config={
-                    'stock_code': '代码',
-                    'stock_name': '名称',
-                },
-                hide_index=True,
-                use_container_width=True
-            )
-            
-            st.caption(f"📊 检测到 {len(abnormal_df)} 只异动股票（时间窗口：{rapid_rise_window}分钟）")
-        else:
-            conditions = []
-            if rise_threshold:
-                conditions.append(f"涨幅>{rise_threshold}%")
-            if fall_threshold:
-                conditions.append(f"跌幅<{fall_threshold}%")
-            condition_text = " 或 ".join(conditions) if conditions else "任何条件"
-            st.info(f"暂无股票在 {rapid_rise_window} 分钟内满足 {condition_text}")
-    
-    with tab4:
-        st.subheader("📈 分时图")
-        
-        if len(engine.all_data) > 0:
-            available_stocks = list(engine.all_data.keys())[:50]
-            stock_codes_with_names = [
-                f"{code} {engine.get_stock_name(code)}" 
-                for code in available_stocks
-            ]
-            
-            selected_stock_display = st.selectbox(
-                "选择股票",
-                options=stock_codes_with_names,
-                index=0
-            )
-            
-            selected_stock = selected_stock_display.split()[0]
-            stock_data = engine.all_data.get(selected_stock)
-            
-            if stock_data is not None and not stock_data.empty:
-                mask = stock_data['datetime'] <= current_time
-                display_data = stock_data[mask]
-                
-                if len(display_data) > 0:
-                    fig = make_subplots(
-                        rows=2, cols=1,
-                        row_heights=[0.7, 0.3],
-                        subplot_titles=('价格走势', '成交量'),
-                        vertical_spacing=0.05,
-                        specs=[[{"secondary_y": True}], [{"secondary_y": False}]]
-                    )
-                    
-                    fig.add_trace(
-                        go.Scatter(
-                            x=display_data['datetime'],
-                            y=display_data['price'],
-                            mode='lines',
-                            name='价格',
-                            line=dict(color='#1f77b4', width=1.5),
-                            fill='tonexty',
-                            fillcolor='rgba(31, 119, 180, 0.1)'
-                        ),
-                        row=1, col=1
-                    )
-                    
-                    if 'pre_close' in display_data.columns:
-                        pre_close = display_data['pre_close'].iloc[0]
-                        fig.add_hline(
-                            y=pre_close,
-                            line_dash="dash",
-                            line_color="gray",
-                            annotation_text=f"昨收: {pre_close:.2f}",
-                            row=1, col=1
-                        )
-                    
-                    colors = ['red' if row['price'] >= display_data['price'].iloc[0] 
-                             else 'green' for _, row in display_data.iterrows()]
-                    
-                    fig.add_trace(
-                        go.Bar(
-                            x=display_data['datetime'],
-                            y=display_data['vol'],
-                            name='成交量',
-                            marker_color=colors,
-                            opacity=0.6
-                        ),
-                        row=2, col=1
-                    )
-                    
-                    current_price = display_data['price'].iloc[-1]
-                    stock_name = engine.get_stock_name(selected_stock)
-                    
-                    if 'pre_close' in display_data.columns:
-                        real_pre_close = display_data['pre_close'].iloc[0]
-                        pct_change = (current_price - real_pre_close) / real_pre_close * 100
-                    else:
-                        real_pre_close = display_data['price'].iloc[0]
-                        pct_change = 0
-
-                    # 计算涨跌停范围
-                    # 计算基础涨跌停范围
-                    base_limit = 0.2 if (selected_stock.startswith('688') or selected_stock.startswith('300') or selected_stock.startswith('689')) else 0.1
-                    if selected_stock.startswith(('8', '4', '92')): base_limit = 0.3
-                    
-                    # 检查实际价格波动是否超过限制 (如新股上市)
-                    max_price = display_data['price'].max()
-                    min_price = display_data['price'].min()
-                    max_dev = max(abs(max_price - real_pre_close), abs(min_price - real_pre_close)) / real_pre_close
-                    
-                    # 如果实际波动超过基础限制，则使用实际波动+10%余量
-                    limit_ratio = max(base_limit, max_dev * 1.1)
-                    
-                    y_min = real_pre_close * (1 - limit_ratio)
-                    y_max = real_pre_close * (1 + limit_ratio)
-                    
-                    fig.update_layout(
-                        title=f"{selected_stock} {stock_name} - 当前: ¥{current_price:.2f} ({pct_change:+.2f}%)",
-                        xaxis_title="时间",
-                        yaxis_title="价格(元)",
-                        yaxis_title_standoff=0,
-                        height=600,
-                        showlegend=True,
-                        hovermode='x unified',
-                        yaxis=dict(
-                            title="价格",
-                            range=[y_min, y_max],
-                            tickformat=".2f",
-                            gridcolor='rgba(128,128,128,0.2)'
-                        ),
-                        yaxis2=dict(
-                            title="涨跌幅",
-                            range=[-limit_ratio*100, limit_ratio*100],
-                            tickformat=".1f",
-                            ticksuffix="%",
-                            showgrid=False,
-                            overlaying="y", 
-                            side="right"
-                        )
-                    )
-                    
-                    fig.update_xaxes(tickformat="%H:%M")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("当前时间点暂无数据")
-            else:
-                st.warning(f"未加载股票 {selected_stock} 的数据")
-        else:
-            st.info("请先加载股票数据")
-    
     with tab5:
         heat_tab1, heat_tab2, heat_tab3 = st.tabs(["📊 热度卡片", "🗺️ 热力图", "🚀 拉升板块"])
         
