@@ -1,0 +1,22 @@
+# A股历史复盘系统 - 依赖包
+
+# 核心库
+pandas>=2.0.0
+numpy>=1.24.0
+pyarrow>=12.0.0  # parquet文件支持
+
+# 数据下载
+pytdx>=1.72
+
+# 可视化
+streamlit>=1.32.0
+plotly>=5.18.0
+
+# 工具库
+tqdm>=4.66.0  # 进度条
+python-dateutil>=2.8.0
+psutil>=5.9.0  # 系统性能监控
+
+# 可选: 性能优化
+# numba>=0.58.0  # JIT编译加速
+# polars>=0.20.0  # 更快的DataFrame库

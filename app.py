@@ -1,0 +1,1230 @@
+"""
+A股历史复盘系统 - Web可视化界面
+基于Streamlit构建
+"""
+
+import streamlit as st
+import pandas as pd
+from datetime import datetime, time
+import time as time_module
+from pathlib import Path
+import sys
+
+# 添加项目根目录到路径
+sys.path.append(str(Path(__file__).parent))
+
+from replay_engine import ReplayEngine
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from sector_analysis import render_sector_analysis, render_sector_heatmap, render_rapid_rise_sectors
+from downloader import StockDataDownloader
+from download_pre_close import download_pre_close_parallel, get_stock_pre_close_single
+from config import SECTOR_MAPPING_CONFIG
+
+# 页面配置
+st.set_page_config(
+    page_title="A股历史复盘系统",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# 自定义样式
+st.markdown("""
+<style>
+    .stMetric {
+        background-color: #f0f2f6;
+        padding: 10px;
+        border-radius: 5px;
+    }
+    .big-font {
+        font-size: 24px !important;
+        font-weight: bold;
+    }
+    .gain {
+        color: #ff4444;
+    }
+    .loss {
+        color: #00aa00;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+def format_pct_change(value):
+    """格式化涨跌幅"""
+    if value > 0:
+        return f'<span class="gain">+{value:.2f}%</span>'
+    elif value < 0:
+        return f'<span class="loss">{value:.2f}%</span>'
+    else:
+        return f'{value:.2f}%'
+
+
+@st.fragment(run_every="1s")
+def auto_refresh_display(engine, current_date, start_time, end_time, 
+                         replay_speed_multiplier, top_n_stocks, top_n_sectors,
+                         rapid_rise_window, rapid_rise_threshold):
+    """
+    自动刷新的数据展示区域（使用 fragment 实现局部刷新）
+    """
+    # 如果引擎正在加载或未就绪，跳过执行，避免 Fragment ID 冲突
+    if 'engine' not in st.session_state or st.session_state.get('current_dir') is None:
+        return
+        
+    # 初始化或获取回放时间
+    if 'replay_time' not in st.session_state:
+        if hasattr(engine, 'data_start_time') and engine.data_start_time:
+            st.session_state.replay_time = engine.data_start_time
+        else:
+            st.session_state.replay_time = datetime.combine(current_date, start_time)
+    
+    end_datetime = datetime.combine(current_date, end_time)
+    
+    # 只有在自动刷新开启时才推进时间
+    if st.session_state.get('auto_refresh', False):
+        if st.session_state.replay_time < end_datetime:
+            new_time = st.session_state.replay_time + pd.Timedelta(seconds=replay_speed_multiplier)
+            
+            # 跳过午休时间 (11:30-13:00)
+            if new_time.time() >= time(11, 30) and new_time.time() < time(13, 0):
+                # 如果推进后进入午休时间，直接跳到 13:00
+                if st.session_state.replay_time.time() < time(11, 30):
+                    new_time = datetime.combine(current_date, time(13, 0))
+            
+            st.session_state.replay_time = new_time
+    
+    current_time = st.session_state.replay_time
+    
+    # 显示当前时间
+    st.markdown(
+        f"<h2 style='text-align: center;'>⏰ {current_time.strftime('%H:%M:%S')}</h2>",
+        unsafe_allow_html=True
+    )
+    
+    # 时间轴滑块（手动定位）
+    start_datetime = datetime.combine(current_date, start_time)
+    if hasattr(engine, 'data_start_time') and engine.data_start_time:
+        start_datetime = engine.data_start_time
+    
+    # 计算总秒数
+    total_seconds = int((end_datetime - start_datetime).total_seconds())
+    current_seconds = int((current_time - start_datetime).total_seconds())
+    
+    # 创建滑块和控制按钮
+    col_slider, col_btn_play, col_btn_reset, col_time = st.columns([6, 0.8, 0.8, 1.2])
+    
+    with col_slider:
+        new_seconds = st.slider(
+            "🕐 时间轴",
+            min_value=0,
+            max_value=total_seconds,
+            value=current_seconds,
+            label_visibility="collapsed"
+        )
+        
+    with col_btn_play:
+        # 根据状态显示不同的按钮
+        is_playing = st.session_state.get('auto_refresh', False)
+        if is_playing:
+            if st.button("⏸️", help="暂停", use_container_width=True):
+                st.session_state.auto_refresh = False
+        else:
+            if st.button("▶️", help="播放", use_container_width=True):
+                st.session_state.auto_refresh = True
+
+    with col_btn_reset:
+        if st.button("🔄", help="重置", use_container_width=True):
+            if 'replay_time' in st.session_state:
+                del st.session_state.replay_time
+            st.session_state.auto_refresh = False
+
+    with col_time:
+        slider_time = start_datetime + pd.Timedelta(seconds=new_seconds)
+        # 垂直居中对齐时间
+        st.markdown(f"<div style='line-height: 2.2;'>⏱️ {slider_time.strftime('%H:%M:%S')}</div>", unsafe_allow_html=True)
+    
+    # 如果用户拖动了滑块，更新时间
+    if new_seconds != current_seconds:
+        st.session_state.replay_time = start_datetime + pd.Timedelta(seconds=new_seconds)
+        st.session_state.auto_refresh = False  # 拖动时自动暂停
+    
+    # 获取快照
+    snapshot = engine.get_snapshot_at_time(current_time)
+    
+    # 显示市场统计 - 使用自定义样式确保文字清晰
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.markdown(
+            """
+            <div style="
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            ">
+                <p style="
+                    color: rgba(255, 255, 255, 0.9);
+                    font-size: 14px;
+                    margin: 0 0 8px 0;
+                    font-weight: 500;
+                ">总股票数</p>
+                <p style="
+                    color: #FFFFFF;
+                    font-size: 32px;
+                    margin: 0;
+                    font-weight: bold;
+                    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+                ">{}</p>
+            </div>
+            """.format(snapshot['stats']['total_stocks']),
+            unsafe_allow_html=True
+        )
+    with col2:
+        st.markdown(
+            """
+            <div style="
+                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            ">
+                <p style="
+                    color: rgba(255, 255, 255, 0.9);
+                    font-size: 14px;
+                    margin: 0 0 8px 0;
+                    font-weight: 500;
+                ">上涨</p>
+                <p style="
+                    color: #FFFFFF;
+                    font-size: 32px;
+                    margin: 0;
+                    font-weight: bold;
+                    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+                ">{}</p>
+            </div>
+            """.format(snapshot['stats']['up_count']),
+            unsafe_allow_html=True
+        )
+    with col3:
+        st.markdown(
+            """
+            <div style="
+                background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            ">
+                <p style="
+                    color: rgba(255, 255, 255, 0.9);
+                    font-size: 14px;
+                    margin: 0 0 8px 0;
+                    font-weight: 500;
+                ">下跌</p>
+                <p style="
+                    color: #FFFFFF;
+                    font-size: 32px;
+                    margin: 0;
+                    font-weight: bold;
+                    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+                ">{}</p>
+            </div>
+            """.format(snapshot['stats']['down_count']),
+            unsafe_allow_html=True
+        )
+    with col4:
+        st.markdown(
+            """
+            <div style="
+                background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+                padding: 20px;
+                border-radius: 10px;
+                text-align: center;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            ">
+                <p style="
+                    color: rgba(255, 255, 255, 0.9);
+                    font-size: 14px;
+                    margin: 0 0 8px 0;
+                    font-weight: 500;
+                ">平盘</p>
+                <p style="
+                    color: #FFFFFF;
+                    font-size: 32px;
+                    margin: 0;
+                    font-weight: bold;
+                    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+                ">{}</p>
+            </div>
+            """.format(snapshot['stats']['flat_count']),
+            unsafe_allow_html=True
+        )
+    
+    # 创建标签页
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 个股排行", 
+        "🏢 板块排行", 
+        "⚡ 异动监控", 
+        "📈 分时图",
+        "🔥 板块热度"
+    ])
+    
+    with tab1:
+        st.subheader("📊 个股涨幅排行")
+        stock_rankings = engine.calculate_stock_rankings(snapshot, top_n=6000)
+        
+        if not stock_rankings.empty:
+            # 布局：在表格上方添加排序控制
+            col_ctrl, col_info = st.columns([1, 3])
+            with col_ctrl:
+                # 使用单选框来控制排序，这样刷新时能保持状态
+                sort_mode = st.radio(
+                    "排序模式", 
+                    ["涨幅榜 🔴", "跌幅榜 🟢"], 
+                    horizontal=True,
+                    label_visibility="collapsed"
+                )
+            with col_info:
+                st.info(f"💡 当前查看：{sort_mode}  | 数据实时刷新中...")
+
+            # 根据选择的模式对数据进行排序
+            if "跌幅榜" in sort_mode:
+                # 升序排列（跌幅大的在前）
+                stock_rankings = stock_rankings.sort_values(by='pct_change', ascending=True)
+            else:
+                # 降序排列（涨幅大的在前，默认已经排好，但为了保险再排一次）
+                stock_rankings = stock_rankings.sort_values(by='pct_change', ascending=False)
+
+            # 构造用于显示的 DataFrame
+            # 必须 reset_index，否则 on_select 返回的 row index 可能会与 iloc 不匹配（如果原始 index 不连续）
+            df_display = stock_rankings.copy().reset_index(drop=True)
+            
+            # 添加排名列（注意：这只是初始排名，用户排序后排名列数字不会变）
+            df_display['排名'] = df_display.index + 1
+            
+            # 重命名列为中文
+            df_show = df_display.rename(columns={
+                'stock_name': '名称',
+                'stock_code': '代码',
+                'price': '价格',
+                'pct_change': '涨跌幅',
+                'volume': '成交量'
+            })
+            
+            # 只保留需要的列
+            df_show = df_show[['排名', '代码', '名称', '价格', '涨跌幅', '成交量']]
+            
+            # 定义样式函数：红涨绿跌
+            def color_change(val):
+                if val > 0:
+                    return 'color: #ff4444'  # 红色
+                elif val < 0:
+                    return 'color: #00dd88'  # 绿色
+                return 'color: #e0e0e0'      # 默认灰白
+            
+            # 应用样式
+            # 注意：Styler 对象传给 dataframe 后，on_select 返回的索引依然对应原始 DataFrame 的索引
+            styled_df = df_show.style.map(color_change, subset=['涨跌幅'])
+            
+            # 配置列显示格式
+            column_config = {
+                "排名": st.column_config.NumberColumn("排名", width="small", format="%d"),
+                "代码": st.column_config.TextColumn("代码", width="medium"),
+                "名称": st.column_config.TextColumn("名称", width="medium"),
+                # 价格去掉 ¥ 符号
+                "价格": st.column_config.NumberColumn("价格", width="medium", format="%.2f"),
+                "涨跌幅": st.column_config.NumberColumn("涨跌幅", width="medium", format="%.2f%%"),
+                "成交量": st.column_config.NumberColumn("成交量", width="medium", format="%d")
+            }
+            
+            # 显示表格（简化版，不用on_select）
+            st.dataframe(
+                styled_df,
+                column_config=column_config,
+                use_container_width=True,
+                hide_index=True,
+                key="stock_ranking_display"
+            )
+            
+            
+            # 个股分时详情查看器
+            st.divider()
+            st.markdown("### 🔍 个股分时详情查看器")
+            
+            # 检查是否在播放中
+            is_playing = st.session_state.get('auto_refresh', False)
+            
+            if is_playing:
+                st.warning("⚠️ **请先暂停回放再查看个股详情**\n\n点击上方 ⏸️ 按钮暂停回放，以便更好地分析个股分时数据。")
+            else:
+                # 统一的说明
+                st.caption("💡 请先在左侧搜索框输入股票代码或名称，然后从右侧下拉框选择")
+                
+                # 搜索框和选择器（同一水平线）
+                col_search, col_select = st.columns([2, 3])
+                
+                with col_search:
+                    search_text = st.text_input(
+                        "搜索",
+                        placeholder="输入股票代码或名称...",
+                        help="支持模糊搜索",
+                        label_visibility="collapsed",  # 隐藏标签，与选择框对齐
+                        key="stock_search_input"
+                    )
+                
+                # 创建完整的股票列表（所有已加载的股票）
+                all_stock_options = []
+                for code in sorted(engine.all_data.keys()):
+                    name = engine.get_stock_name(code)
+                    all_stock_options.append(f"{code} {name}")
+                
+                # 根据搜索文本过滤
+                if search_text:
+                    filtered_options = [
+                        opt for opt in all_stock_options 
+                        if search_text.upper() in opt.upper()
+                    ]
+                else:
+                    # 默认显示排行榜前50只
+                    filtered_options = [f"{row['stock_code']} {row['stock_name']}" 
+                                      for _, row in stock_rankings.head(50).iterrows()]
+                
+                with col_select:
+                    if filtered_options:
+                        selected_option = st.selectbox(
+                            "选择股票" if not search_text else f"搜索结果 ({len(filtered_options)} 只)",
+                            options=["不选择"] + filtered_options,
+                            label_visibility="collapsed",
+                            key="stock_detail_selector"
+                        )
+                    else:
+                        st.info("未找到匹配的股票")
+                        selected_option = "不选择"
+                
+                # 显示股票详情
+                if selected_option != "不选择":
+                    stock_code = selected_option.split()[0]
+                    stock_name = selected_option.split()[1]
+                    
+                    # 获取股票数据
+                    stock_data = engine.all_data.get(stock_code)
+                    
+                    if stock_data is not None and not stock_data.empty:
+                        # 筛选到当前时间的数据
+                        mask = stock_data['datetime'] <= current_time
+                        display_data = stock_data[mask]
+                        
+                        if len(display_data) > 0:
+                            # 创建标签页：分时图 和 逐笔交易
+                            detail_tab1, detail_tab2 = st.tabs(["📈 分时图", "📋 逐笔交易"])
+                            
+                            with detail_tab1:
+                                # 分时图
+                                fig = make_subplots(
+                                    rows=2, cols=1,
+                                    row_heights=[0.7, 0.3],
+                                    vertical_spacing=0.05
+                                )
+                                
+                                # 价格线
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=display_data['datetime'],
+                                        y=display_data['price'],
+                                        mode='lines',
+                                        name='价格',
+                                        line=dict(color='#1f77b4', width=1.5),
+                                        fill='tozeroy',
+                                        fillcolor='rgba(31, 119, 180, 0.1)'
+                                    ),
+                                    row=1, col=1
+                                )
+                                
+                                # 昨收价参考线
+                                if 'pre_close' in display_data.columns:
+                                    pre_close = display_data['pre_close'].iloc[0]
+                                    fig.add_hline(
+                                        y=pre_close,
+                                        line_dash="dash",
+                                        line_color="gray",
+                                        annotation_text=f"昨收: {pre_close:.2f}",
+                                        row=1, col=1
+                                    )
+                                
+                                # 成交量柱状图
+                                fig.add_trace(
+                                    go.Bar(
+                                        x=display_data['datetime'],
+                                        y=display_data['vol'],
+                                        name='成交量',
+                                        marker_color='rgba(100, 100, 255, 0.5)'
+                                    ),
+                                    row=2, col=1
+                                )
+                                
+                                # 更新布局
+                                current_price = display_data['price'].iloc[-1]
+                                pct_change = ((current_price - pre_close) / pre_close * 100) if 'pre_close' in display_data.columns else 0
+                                
+                                fig.update_layout(
+                                    title=f"{stock_code} {stock_name} - 当前: ¥{current_price:.2f} ({pct_change:+.2f}%)",
+                                    height=450,
+                                    showlegend=False,
+                                    hovermode='x unified',
+                                    margin=dict(l=0, r=0, t=40, b=0)
+                                )
+                                
+                                fig.update_xaxes(tickformat="%H:%M")
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                
+                                # 显示统计信息 - 自定义样式确保文字清晰
+                                stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+                                
+                                with stat_col1:
+                                    st.markdown(
+                                        """
+                                        <div style="
+                                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                            padding: 15px;
+                                            border-radius: 8px;
+                                            text-align: center;
+                                            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+                                        ">
+                                            <p style="
+                                                color: rgba(255, 255, 255, 0.9);
+                                                font-size: 12px;
+                                                margin: 0 0 5px 0;
+                                                font-weight: 500;
+                                            ">当前价</p>
+                                            <p style="
+                                                color: #FFFFFF;
+                                                font-size: 24px;
+                                                margin: 0;
+                                                font-weight: bold;
+                                                text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+                                            ">¥{:.2f}</p>
+                                        </div>
+                                        """.format(current_price),
+                                        unsafe_allow_html=True
+                                    )
+                                
+                                with stat_col2:
+                                    pct_color = "#f093fb" if pct_change >= 0 else "#4facfe"
+                                    pct_color2 = "#f5576c" if pct_change >= 0 else "#00f2fe"
+                                    st.markdown(
+                                        """
+                                        <div style="
+                                            background: linear-gradient(135deg, {} 0%, {} 100%);
+                                            padding: 15px;
+                                            border-radius: 8px;
+                                            text-align: center;
+                                            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+                                        ">
+                                            <p style="
+                                                color: rgba(255, 255, 255, 0.9);
+                                                font-size: 12px;
+                                                margin: 0 0 5px 0;
+                                                font-weight: 500;
+                                            ">涨跌幅</p>
+                                            <p style="
+                                                color: #FFFFFF;
+                                                font-size: 24px;
+                                                margin: 0;
+                                                font-weight: bold;
+                                                text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+                                            ">{:+.2f}%</p>
+                                        </div>
+                                        """.format(pct_color, pct_color2, pct_change),
+                                        unsafe_allow_html=True
+                                    )
+                                
+                                with stat_col3:
+                                    st.markdown(
+                                        """
+                                        <div style="
+                                            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+                                            padding: 15px;
+                                            border-radius: 8px;
+                                            text-align: center;
+                                            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+                                        ">
+                                            <p style="
+                                                color: rgba(255, 255, 255, 0.9);
+                                                font-size: 12px;
+                                                margin: 0 0 5px 0;
+                                                font-weight: 500;
+                                            ">成交量</p>
+                                            <p style="
+                                                color: #FFFFFF;
+                                                font-size: 24px;
+                                                margin: 0;
+                                                font-weight: bold;
+                                                text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+                                            ">{:.0f}手</p>
+                                        </div>
+                                        """.format(display_data['vol'].sum()),
+                                        unsafe_allow_html=True
+                                    )
+                                
+                                with stat_col4:
+                                    if 'cum_volume' in display_data.columns:
+                                        total_amount = display_data['cum_volume'].iloc[-1] * current_price / 10000
+                                        st.markdown(
+                                            """
+                                            <div style="
+                                                background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+                                                padding: 15px;
+                                                border-radius: 8px;
+                                                text-align: center;
+                                                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+                                            ">
+                                                <p style="
+                                                    color: rgba(255, 255, 255, 0.9);
+                                                    font-size: 12px;
+                                                    margin: 0 0 5px 0;
+                                                    font-weight: 500;
+                                                ">成交额</p>
+                                                <p style="
+                                                    color: #FFFFFF;
+                                                    font-size: 24px;
+                                                    margin: 0;
+                                                    font-weight: bold;
+                                                    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+                                                ">{:.1f}万</p>
+                                            </div>
+                                            """.format(total_amount),
+                                            unsafe_allow_html=True
+                                        )
+                                    else:
+                                        st.markdown(
+                                            """
+                                            <div style="
+                                                background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+                                                padding: 15px;
+                                                border-radius: 8px;
+                                                text-align: center;
+                                                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+                                            ">
+                                                <p style="
+                                                    color: rgba(255, 255, 255, 0.9);
+                                                    font-size: 12px;
+                                                    margin: 0 0 5px 0;
+                                                    font-weight: 500;
+                                                ">成交额</p>
+                                                <p style="
+                                                    color: #FFFFFF;
+                                                    font-size: 24px;
+                                                    margin: 0;
+                                                    font-weight: bold;
+                                                    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+                                                ">-</p>
+                                            </div>
+                                            """,
+                                            unsafe_allow_html=True
+                                        )
+                            
+                            with detail_tab2:
+                                # 逐笔交易明细
+                                st.markdown(f"**逐笔交易明细（共 {len(display_data)} 笔）**")
+                                
+                                # 格式化显示
+                                tick_display = display_data[['datetime', 'price', 'vol']].copy()
+                                
+                                # 添加涨跌标识
+                                if len(tick_display) > 1:
+                                    tick_display['变化'] = tick_display['price'].diff()
+                                    tick_display['方向'] = tick_display['变化'].apply(
+                                        lambda x: '🔴 ↑' if x > 0 else ('🟢 ↓' if x < 0 else '⚪ ─')
+                                    )
+                                else:
+                                    tick_display['方向'] = '⚪ ─'
+                                
+                                # 反向排序（最新的在前）
+                                tick_display = tick_display.sort_values('datetime', ascending=False)
+                                
+                                # 格式化列
+                                tick_display['时间'] = tick_display['datetime'].dt.strftime('%H:%M:%S')
+                                tick_display['价格'] = tick_display['price'].apply(lambda x: f"¥{x:.2f}")
+                                tick_display['成交量'] = tick_display['vol'].apply(lambda x: f"{int(x)}")
+                                
+                                # 选择显示的列
+                                display_cols = ['时间', '价格', '成交量', '方向']
+                                
+                                # 显示数据表格（带滚动）
+                                st.dataframe(
+                                    tick_display[display_cols],
+                                    column_config={
+                                        "时间": st.column_config.TextColumn("时间", width="medium"),
+                                        "价格": st.column_config.TextColumn("价格", width="medium"),
+                                        "成交量": st.column_config.TextColumn("成交量(手)", width="medium"),
+                                        "方向": st.column_config.TextColumn("方向", width="small"),
+                                    },
+                                    hide_index=True,
+                                    height=500,
+                                    use_container_width=True
+                                )
+                                
+                                # 添加下载按钮
+                                st.divider()
+                                csv = tick_display[display_cols].to_csv(index=False, encoding='utf-8-sig')
+                                st.download_button(
+                                    label="📥 下载逐笔数据 (CSV)",
+                                    data=csv,
+                                    file_name=f"{stock_code}_{stock_name}_逐笔_{current_time.strftime('%Y%m%d_%H%M%S')}.csv",
+                                    mime="text/csv",
+                                    use_container_width=True
+                                )
+                        else:
+                            st.info("⏳ 当前时间点暂无数据（请推进回放时间查看）")
+                    else:
+                        st.warning(f"❌ 未加载股票 {stock_code} 的数据")
+        else:
+            st.info("暂无数据")
+    
+    with tab2:
+        st.subheader("🏢 板块涨幅排行")
+        sector_rankings = engine.calculate_sector_rankings(snapshot, top_n=top_n_sectors)
+        
+        if not sector_rankings.empty:
+            display_df = sector_rankings.copy()
+            display_df['平均涨跌幅'] = display_df['avg_pct_change'].apply(
+                lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%"
+            )
+            
+            st.dataframe(
+                display_df[['sector', '平均涨跌幅', 'stock_count']],
+                column_config={
+                    'sector': '板块',
+                    'stock_count': '成分股数量',
+                },
+                hide_index=False,
+                width='stretch'
+            )
+        else:
+            st.info("暂无数据(请确保已加载行业映射文件)")
+    
+    with tab3:
+        st.subheader("⚡ 异动监控")
+        
+        # 添加异动监控条件设置
+        col_filter1, col_filter2, col_filter3 = st.columns(3)
+        
+        with col_filter1:
+            monitor_rise = st.checkbox("监控涨幅", value=True, help="监控快速拉升")
+            if monitor_rise:
+                rise_threshold = st.slider("涨幅阈值(%)", 1.0, 10.0, rapid_rise_threshold, 0.5, key="rise_thresh")
+            else:
+                rise_threshold = None
+        
+        with col_filter2:
+            monitor_fall = st.checkbox("监控跌幅", value=True, help="监控快速下跌")
+            if monitor_fall:
+                fall_threshold = st.slider("跌幅阈值(%)", -10.0, -1.0, -rapid_rise_threshold, 0.5, key="fall_thresh")
+            else:
+                fall_threshold = None
+        
+        with col_filter3:
+            enable_volume_filter = st.checkbox("成交额过滤", value=False, help="只显示成交额达到一定金额的异动")
+            if enable_volume_filter:
+                volume_threshold = st.number_input("最小成交额(万元)", min_value=0, value=100, step=50, key="vol_thresh")
+            else:
+                volume_threshold = None
+        
+        # 调用异动检测
+        abnormal_stocks = engine.detect_abnormal_movement(
+            time_window_minutes=rapid_rise_window,
+            rise_threshold=rise_threshold,
+            fall_threshold=fall_threshold,
+            volume_threshold=volume_threshold
+        )
+        
+        if abnormal_stocks:
+            abnormal_df = pd.DataFrame(abnormal_stocks)
+            # 添加股票名称
+            abnormal_df['stock_name'] = abnormal_df['stock_code'].apply(lambda x: engine.get_stock_name(x))
+            
+            # 格式化异动类型
+            def format_movement_type(row):
+                if row['movement_type'] == 'rise':
+                    return f"🔴 +{row['pct_change']:.2f}%"
+                else:
+                    return f"🟢 {row['pct_change']:.2f}%"
+            
+            abnormal_df['异动'] = abnormal_df.apply(format_movement_type, axis=1)
+            abnormal_df['起始价'] = abnormal_df['start_price'].apply(lambda x: f"¥{x:.2f}")
+            abnormal_df['当前价'] = abnormal_df['end_price'].apply(lambda x: f"¥{x:.2f}")
+            abnormal_df['成交额'] = abnormal_df['volume_amount'].apply(lambda x: f"{x:.1f}万")
+            
+            # 显示异动列表
+            st.dataframe(
+                abnormal_df[['stock_code', 'stock_name', '起始价', '当前价', '异动', '成交额']],
+                column_config={
+                    'stock_code': '代码',
+                    'stock_name': '名称',
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.caption(f"📊 检测到 {len(abnormal_df)} 只异动股票（时间窗口：{rapid_rise_window}分钟）")
+        else:
+            conditions = []
+            if rise_threshold:
+                conditions.append(f"涨幅>{rise_threshold}%")
+            if fall_threshold:
+                conditions.append(f"跌幅<{fall_threshold}%")
+            condition_text = " 或 ".join(conditions) if conditions else "任何条件"
+            st.info(f"暂无股票在 {rapid_rise_window} 分钟内满足 {condition_text}")
+    
+    with tab4:
+        st.subheader("📈 分时图")
+        
+        if len(engine.all_data) > 0:
+            available_stocks = list(engine.all_data.keys())[:50]
+            stock_codes_with_names = [
+                f"{code} {engine.get_stock_name(code)}" 
+                for code in available_stocks
+            ]
+            
+            selected_stock_display = st.selectbox(
+                "选择股票",
+                options=stock_codes_with_names,
+                index=0
+            )
+            
+            selected_stock = selected_stock_display.split()[0]
+            stock_data = engine.all_data.get(selected_stock)
+            
+            if stock_data is not None and not stock_data.empty:
+                mask = stock_data['datetime'] <= current_time
+                display_data = stock_data[mask]
+                
+                if len(display_data) > 0:
+                    fig = make_subplots(
+                        rows=2, cols=1,
+                        row_heights=[0.7, 0.3],
+                        subplot_titles=('价格走势', '成交量'),
+                        vertical_spacing=0.05
+                    )
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=display_data['datetime'],
+                            y=display_data['price'],
+                            mode='lines',
+                            name='价格',
+                            line=dict(color='#1f77b4', width=1.5),
+                            fill='tonexty',
+                            fillcolor='rgba(31, 119, 180, 0.1)'
+                        ),
+                        row=1, col=1
+                    )
+                    
+                    if 'pre_close' in display_data.columns:
+                        pre_close = display_data['pre_close'].iloc[0]
+                        fig.add_hline(
+                            y=pre_close,
+                            line_dash="dash",
+                            line_color="gray",
+                            annotation_text=f"昨收: {pre_close:.2f}",
+                            row=1, col=1
+                        )
+                    
+                    colors = ['red' if row['price'] >= display_data['price'].iloc[0] 
+                             else 'green' for _, row in display_data.iterrows()]
+                    
+                    fig.add_trace(
+                        go.Bar(
+                            x=display_data['datetime'],
+                            y=display_data['vol'],
+                            name='成交量',
+                            marker_color=colors,
+                            opacity=0.6
+                        ),
+                        row=2, col=1
+                    )
+                    
+                    current_price = display_data['price'].iloc[-1]
+                    stock_name = engine.get_stock_name(selected_stock)
+                    pct_change = ((current_price - pre_close) / pre_close * 100) if 'pre_close' in display_data.columns else 0
+                    
+                    fig.update_layout(
+                        title=f"{selected_stock} {stock_name} - 当前: ¥{current_price:.2f} ({pct_change:+.2f}%)",
+                        xaxis_title="时间",
+                        yaxis_title="价格(元)",
+                        yaxis2_title="成交量(手)",
+                        height=600,
+                        showlegend=True,
+                        hovermode='x unified'
+                    )
+                    
+                    fig.update_xaxes(tickformat="%H:%M")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("当前时间点暂无数据")
+            else:
+                st.warning(f"未加载股票 {selected_stock} 的数据")
+        else:
+            st.info("请先加载股票数据")
+    
+    with tab5:
+        heat_tab1, heat_tab2, heat_tab3 = st.tabs(["📊 热度卡片", "🗺️ 热力图", "🚀 拉升板块"])
+        
+        with heat_tab1:
+            render_sector_analysis(engine, snapshot, top_n=10)
+        
+        with heat_tab2:
+            render_sector_heatmap(engine, snapshot)
+        
+        with heat_tab3:
+            render_rapid_rise_sectors(
+                engine, 
+                snapshot, 
+                time_window=rapid_rise_window,
+                threshold=rapid_rise_threshold,
+                top_n=10
+            )
+
+
+def render_replay_page():
+    st.title("📈 A股历史复盘系统")
+    
+    # 侧边栏配置
+    with st.sidebar:
+        st.header("⚙️ 复盘配置")
+        
+        # 数据目录选择 - 支持两种结构
+        # 1. 新结构: data/20251222/tick/
+        # 2. 旧结构: data/tick_20251222/
+        
+        data_dirs = []
+        
+        # 查找新结构
+        for date_dir in Path("data").glob("*"):
+            if date_dir.is_dir() and date_dir.name.isdigit() and len(date_dir.name) == 8:
+                tick_dir = date_dir / "tick"
+                if tick_dir.exists() and tick_dir.is_dir():
+                    data_dirs.append(tick_dir)
+        
+        # 查找旧结构
+        data_dirs.extend(list(Path("data").glob("tick_*")))
+        
+        if not data_dirs:
+            st.error("未找到数据目录,请先下载数据!")
+            st.stop()
+        
+        # 按日期排序（最新的在前）
+        data_dirs.sort(reverse=True, key=lambda x: x.name if x.name.startswith('tick_') else x.parent.name)
+        
+        selected_dir = st.selectbox(
+            "选择交易日期",
+            options=data_dirs,
+            format_func=lambda x: x.name.replace("tick_", "") if x.name.startswith("tick_") else x.parent.name
+        )
+        
+        st.divider()
+        
+        # 提取数据日期
+        if selected_dir.name == 'tick':
+            date_str = selected_dir.parent.name
+        elif selected_dir.name.startswith('tick_'):
+            date_str = selected_dir.name.replace("tick_", "")
+        else:
+            date_str = selected_dir.name
+        try:
+            current_date = datetime.strptime(date_str, "%Y%m%d").date()
+        except:
+            current_date = datetime.today().date()
+            
+        start_time = st.time_input("开始时间", value=time(9, 30))
+        end_time = st.time_input("结束时间", value=time(15, 0))
+        
+        replay_speed_multiplier = st.select_slider(
+            "回放速度",
+            options=[1, 5, 10, 30, 60, 120, 300, 600],
+            value=60,
+            format_func=lambda x: f"{x}x"
+        )
+        
+        st.caption(f"💡 每秒推进 {replay_speed_multiplier} 秒真实时间")
+        
+        st.divider()
+        
+        # 显示设置
+        st.subheader("显示设置")
+        
+        # 板块映射源选择
+        current_source = SECTOR_MAPPING_CONFIG.get('source', 'iwencai')
+        sector_source = st.selectbox(
+            "板块映射源",
+            options=["iwencai", "eastmoney"],
+            index=0 if current_source == 'iwencai' else 1,
+            help="选择不同的板块映射格式：iwencai（更全面）或 eastmoney（传统分类）"
+        )
+        
+        # 如果设置改变，更新 config 并重新加载
+        if sector_source != current_source:
+            SECTOR_MAPPING_CONFIG['source'] = sector_source
+            if 'engine' in st.session_state:
+                # 清空旧映射
+                st.session_state.engine.industry_map = {}
+                st.session_state.engine.concept_map = {}
+                st.session_state.engine.region_map = {}
+                # 重新加载
+                st.session_state.engine.load_sector_mappings()
+                st.toast(f"✅ 板块映射源已切换至 {sector_source}")
+                st.rerun()
+        
+        top_n_stocks = st.number_input("个股排行显示数量", min_value=10, max_value=100, value=30)
+        top_n_sectors = st.number_input("板块排行显示数量", min_value=5, max_value=50, value=15)
+        
+        rapid_rise_window = st.slider("异动检测时间窗口(分钟)", 1, 30, 5, help="检测股票在此时间窗口内的涨跌幅变化")
+        rapid_rise_threshold = st.slider("异动幅度阈值(%)", 1.0, 10.0, 3.0, 0.5, help="默认涨跌幅阈值，可在异动监控页面单独调整")
+    
+    # 初始化引擎
+    if 'engine' not in st.session_state or st.session_state.get('current_dir') != str(selected_dir):
+        st.session_state.initialized = False
+        with st.spinner("正在初始化复盘引擎..."):
+            st.session_state.engine = ReplayEngine(str(selected_dir))
+            
+            st.session_state.current_dir = str(selected_dir)
+            st.session_state.loaded_stocks = set()
+            st.session_state.data_date = current_date
+        
+        # 数据加载 - 使用多线程并行加载
+        with st.spinner(f"正在加载 {current_date} 的全量数据..."):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # 定义进度回调函数
+            def update_progress(current, total):
+                progress_bar.progress(current / total)
+                status_text.text(f"⚡ 多线程加载中: {current}/{total} 只股票 ({current/total*100:.1f}%)")
+            
+            # 使用多线程加载（8个线程并行）
+            loaded_count = st.session_state.engine.load_all_stocks_parallel(
+                max_workers=8, 
+                progress_callback=update_progress
+            )
+            
+            # 更新已加载股票集合
+            st.session_state.loaded_stocks = set(st.session_state.engine.all_data.keys())
+            
+            progress_bar.empty()
+            status_text.empty()
+            
+            # 刷新一次股票名称映射（从parquet文件中提取）
+            st.session_state.engine.load_stock_names()
+            
+            # 智能检测数据实际起始时间
+            st.session_state.engine.detect_data_time_range()
+        
+        st.success(f"✅ 全量数据加载完成！已加载 {loaded_count} 只股票")
+        
+        # 显示数据时间范围
+        if hasattr(st.session_state.engine, 'data_start_time') and st.session_state.engine.data_start_time:
+            data_start = st.session_state.engine.data_start_time.strftime('%H:%M:%S')
+            data_end = st.session_state.engine.data_end_time.strftime('%H:%M:%S')
+            st.info(f"📊 数据时间范围: {data_start} - {data_end}")
+        
+        if 'replay_time' in st.session_state:
+            del st.session_state.replay_time
+            
+        st.session_state.initialized = True
+    
+    # 检查回放时间逻辑
+    engine = st.session_state.engine
+    if 'replay_time' not in st.session_state or st.session_state.replay_time.date() != current_date:
+        if hasattr(engine, 'data_start_time') and engine.data_start_time:
+            st.session_state.replay_time = engine.data_start_time
+        else:
+            st.session_state.replay_time = datetime.combine(current_date, start_time)
+    
+    # 只有在引擎完全初始化后才渲染回放片段，防止初始化期间的 Fragment ID 错误
+    if st.session_state.get('initialized', False):
+        auto_refresh_display(
+            engine=engine,
+            current_date=current_date,
+            start_time=start_time,
+            end_time=end_time,
+            replay_speed_multiplier=replay_speed_multiplier,
+            top_n_stocks=top_n_stocks,
+            top_n_sectors=top_n_sectors,
+            rapid_rise_window=rapid_rise_window,
+            rapid_rise_threshold=rapid_rise_threshold
+        )
+    else:
+        st.info("⌛ 正在准备回放环境...")
+
+
+def render_download_page():
+    """渲染数据下载页面"""
+    st.title("⬇️ A股历史数据下载")
+    st.markdown("---")
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.subheader("📅 日期选择")
+        # 使用 date_input 实现日历选择，支持范围
+        selected_date = st.date_input(
+            "选择下载日期 (支持选择时间段)",
+            value=datetime.now().date(),
+            min_value=datetime(2020, 1, 1).date(),
+            max_value=datetime.now().date(),
+            help="点击日历选择日期。如果是单日直接点击；如果是范围，先点开始日期再点结束日期。"
+        )
+        
+        st.subheader("📦 数据类型")
+        download_tick = st.checkbox("分时成交数据 (Tick)", value=True, help="包含每三秒的成交快照，用于复盘回放")
+        download_pre_close = st.checkbox("昨收价数据 (Pre-close)", value=True, help="用于计算准确的涨跌幅")
+        
+        st.subheader("⚙️ 下载配置")
+        col_conf1, col_conf2 = st.columns(2)
+        with col_conf1:
+            tick_workers = st.slider("分时数据线程数", 1, 50, 50, help="通达信接口并发数")
+        with col_conf2:
+            pre_close_workers = st.slider("昨收数据线程数", 1, 50, 5, help="HTTP接口并发数，建议设小以免由于反爬导致失败")
+    
+    with col2:
+        st.info("ℹ️ 说明：\n\n1. 系统会自动跳过周末。\n2. 下载的数据将保存在 `data/YYYYMMDD` 目录下。\n3. 分时数据来源于通达信接口，昨收价来源于东方财富。")
+        
+        # 预览选择
+        if isinstance(selected_date, tuple):
+            if len(selected_date) == 2:
+                start_date, end_date = selected_date
+                days = (end_date - start_date).days + 1
+                st.write(f"已选择范围: **{start_date}** 至 **{end_date}** (共 {days} 天)")
+                date_range_mode = True
+            else:
+                st.write(f"已选择: **{selected_date[0]}**")
+                date_range_mode = False
+                start_date = end_date = selected_date[0]
+        else:
+            st.write(f"已选择: **{selected_date}**")
+            date_range_mode = False
+            start_date = end_date = selected_date
+
+    st.markdown("---")
+    
+    # 下载按钮
+    if st.button("🚀 开始下载", type="primary", use_container_width=True):
+        if not (download_tick or download_pre_close):
+            st.warning("⚠️ 请至少选择一种数据类型")
+            return
+
+        status_container = st.status("正在进行下载任务...", expanded=True)
+        
+        try:
+            # 准备日期列表
+            from datetime import timedelta
+            current = start_date
+            dates_to_process = []
+            
+            while current <= end_date:
+                if current.weekday() < 5:  # 跳过周末
+                    dates_to_process.append(current)
+                current += timedelta(days=1)
+            
+            if not dates_to_process:
+                status_container.warning("所选范围内没有交易日（全是周末）")
+                return
+                
+            progress_bar = status_container.progress(0, text="总进度")
+            total_steps = len(dates_to_process)
+            
+            for idx, date_obj in enumerate(dates_to_process):
+                date_str = date_obj.strftime('%Y%m%d')
+                date_display = date_obj.strftime('%Y-%m-%d')
+                
+                status_container.write(f"👉 **正在处理: {date_display}**")
+                
+                # 1. 下载分时数据
+                if download_tick:
+                    output_dir = f"data/{date_str}/tick"
+                    downloader = StockDataDownloader()
+                    
+                    # 创建子进度条
+                    task_progress = status_container.progress(0, text=f"正在分时数据...")
+                    
+                    # 定义回调函数
+                    def update_tick_progress(curr, total):
+                        percent = min(curr / total, 1.0)
+                        task_progress.progress(percent, text=f"📥 分时数据下载中: {curr}/{total} ({percent:.1%})")
+                        
+                    # 开始下载
+                    downloader.download_all_stocks(int(date_str), max_workers=tick_workers, output_dir=output_dir, progress_callback=update_tick_progress)
+                    
+                    # 下载完成，清空或标记子进度条
+                    task_progress.empty()
+                    status_container.write(f"   - ✅ 分时数据下载完成")
+                
+                # 2. 下载昨收价
+                if download_pre_close:
+                    status_container.write(f"   - 正在下载昨收价...")
+                    try:
+                        save_dir = Path(f"data/{date_str}")
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        target_file = save_dir / f"stock_pre_close_{date_str}.csv"
+                        
+                        # 检查是否已存在
+                        if target_file.exists():
+                            status_container.write(f"   - ✅ 昨收价文件已存在，跳过下载")
+                        else:
+                            # 获取所有股票代码
+                            if download_tick:
+                                import os
+                                tick_dir = Path(output_dir)
+                                if tick_dir.exists():
+                                    codes = [f.stem for f in tick_dir.glob('*.parquet')]
+                                else:
+                                    df = pd.read_csv('data/eastmoney_all_stocks.csv')
+                                    codes = df['stock_code'].astype(str).str.zfill(6).tolist()
+                            else:
+                                df = pd.read_csv('data/eastmoney_all_stocks.csv')
+                                codes = df['stock_code'].astype(str).str.zfill(6).tolist()
+                                
+                            pre_close_df = download_pre_close_parallel(codes, max_workers=pre_close_workers)
+                            
+                            # 保存
+                            pre_close_df.to_csv(target_file, index=False, encoding='utf-8-sig')
+                            status_container.write(f"   - ✅ 昨收价下载完成 ({len(pre_close_df)} 条)")
+                    except Exception as e:
+                        status_container.error(f"   - ❌ 昨收价下载失败: {str(e)}")
+                
+                # 更新总进度
+                progress_bar.progress((idx + 1) / total_steps, text=f"总进度: {idx + 1}/{total_steps}")
+            
+            status_container.update(label="🎉 所有下载任务已完成！", state="complete", expanded=False)
+            st.success("✅ 数据下载成功！请前往「历史复盘」页面选择对应日期进行回放。")
+            st.balloons()
+            
+        except Exception as e:
+            status_container.update(label="❌ 下载过程中发生错误", state="error")
+            st.error(f"错误详情: {str(e)}")
+
+
+def main():
+    # 侧边栏导航
+    st.sidebar.title("🧭 系统导航")
+    page = st.sidebar.radio(
+        "选择功能模块", 
+        ["📺 历史复盘", "⬇️ 数据下载"],
+        captions=["回放分时行情与热度", "获取最新的市场数据"]
+    )
+    
+    st.sidebar.divider()
+    
+    if page == "📺 历史复盘":
+        render_replay_page()
+    else:
+        render_download_page()
+
+
+if __name__ == "__main__":
+    main()
