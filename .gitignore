@@ -71,3 +71,5 @@ desktop.ini
 failed_stocks.csv
 temp/
 backup/
+publish_to_github.sh
+
